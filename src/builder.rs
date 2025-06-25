@@ -6,7 +6,7 @@ use aligned_vec::{ABox, AVec};
 
 /// Builder to create a position-independent arguments memory layout,
 /// as described by the [`ArgsLayoutRef`] type.
-/// 
+///
 /// [`ArgsLayoutRef`]: crate::ArgsLayoutRef
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArgsLayoutBuilder {

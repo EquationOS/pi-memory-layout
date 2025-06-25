@@ -102,7 +102,13 @@ impl<'a> ArgsLayoutRef<'a> {
     /// segmentation faults or UB will occur.
     pub fn argv_raw_iter(&self) -> impl Iterator<Item = *const u8> {
         let buffer = self.get_slice_argv();
-        unsafe { NullTermArrIter::new(self.bytes.as_ptr(), buffer) }
+        unsafe {
+            NullTermArrIter::new(
+                self.bytes.as_ptr(),
+                self.argc.map(|_| size_of::<usize>()),
+                buffer,
+            )
+        }
     }
 
     /// Returns an iterator over the raw environment vector's (`envv`)
@@ -114,7 +120,13 @@ impl<'a> ArgsLayoutRef<'a> {
     /// segmentation faults or UB will occur.
     pub fn envv_raw_iter(&self) -> impl Iterator<Item = *const u8> {
         let buffer = self.get_slice_envv();
-        unsafe { NullTermArrIter::new(self.bytes.as_ptr(), buffer) }
+        unsafe {
+            NullTermArrIter::new(
+                self.bytes.as_ptr(),
+                self.argc.map(|_| size_of::<usize>()),
+                buffer,
+            )
+        }
     }
 
     /// Unsafe version of [`Self::argv_raw_iter`] that only works if all pointers
@@ -129,7 +141,13 @@ impl<'a> ArgsLayoutRef<'a> {
     /// segmentation faults or UB will occur.
     pub unsafe fn argv_iter(&self) -> impl Iterator<Item = &'a CStr> {
         let buffer = self.get_slice_argv();
-        unsafe { CStrArrayIter::new(self.bytes.as_ptr(), buffer) }
+        unsafe {
+            CStrArrayIter::new(
+                self.bytes.as_ptr(),
+                self.argc.map(|_| size_of::<usize>()),
+                buffer,
+            )
+        }
     }
     /// Unsafe version of [`Self::envv_raw_iter`] that only works if all pointers
     /// are valid. It emits high-level items of type [`CStr`].
@@ -143,7 +161,13 @@ impl<'a> ArgsLayoutRef<'a> {
     /// segmentation faults or UB will occur.
     pub unsafe fn envv_iter(&self) -> impl Iterator<Item = &'a CStr> {
         let buffer = self.get_slice_envv();
-        unsafe { CStrArrayIter::new(self.bytes.as_ptr(), buffer) }
+        unsafe {
+            CStrArrayIter::new(
+                self.bytes.as_ptr(),
+                self.argc.map(|_| size_of::<usize>()),
+                buffer,
+            )
+        }
     }
 }
 
@@ -154,6 +178,10 @@ impl<'a> ArgsLayoutRef<'a> {
 #[derive(Debug)]
 struct NullTermArrIter<'a> {
     base: *const u8,
+    // If `bytes` already point to the start of `argv`,
+    // we have to subtract the size of `argc` from the offsets after
+    // the offset is read from the buffer.
+    argc_offset: Option<usize>,
     // Buffer holds more bytes than necessary because the size of the auxv
     // array is not known at compile time.
     buffer: &'a [u8],
@@ -162,10 +190,15 @@ struct NullTermArrIter<'a> {
 
 impl<'a> NullTermArrIter<'a> {
     // SAFETY: If the pointers point to invalid memory, UB will occur.
-    unsafe fn new(base: *const u8, buffer: &'a [u8]) -> Self {
+    unsafe fn new(base: *const u8, argc_offset: Option<usize>, buffer: &'a [u8]) -> Self {
         assert_eq!(buffer.as_ptr().align_offset(align_of::<usize>()), 0);
 
-        Self { base, buffer, i: 0 }
+        Self {
+            base,
+            argc_offset,
+            buffer,
+            i: 0,
+        }
     }
 }
 
@@ -189,6 +222,12 @@ impl Iterator for NullTermArrIter<'_> {
         if offset == 0 {
             return None;
         }
+        // If `argc_offset` is set, we skip the first entry which is the `argc`
+        let offset = if let Some(argc_offset) = self.argc_offset {
+            offset - argc_offset
+        } else {
+            offset
+        };
 
         let entry = unsafe { self.base.add(offset) };
 
@@ -204,6 +243,10 @@ impl Iterator for NullTermArrIter<'_> {
 #[derive(Debug)]
 struct CStrArrayIter<'a> {
     base: *const u8,
+    // If `bytes` already point to the start of `argv`,
+    // we have to subtract the size of `argc` from the offsets after
+    // the offset is read from the buffer.
+    argc_offset: Option<usize>,
     // Buffer holds more bytes than necessary because the size of the auxv
     // array is not known at compile time.
     buffer: &'a [u8],
@@ -212,10 +255,15 @@ struct CStrArrayIter<'a> {
 
 impl<'a> CStrArrayIter<'a> {
     // SAFETY: If the pointers point to invalid memory, UB will occur.
-    unsafe fn new(base: *const u8, buffer: &'a [u8]) -> Self {
+    unsafe fn new(base: *const u8, argc_offset: Option<usize>, buffer: &'a [u8]) -> Self {
         assert_eq!(buffer.as_ptr().align_offset(align_of::<usize>()), 0);
 
-        Self { base, buffer, i: 0 }
+        Self {
+            base,
+            argc_offset,
+            buffer,
+            i: 0,
+        }
     }
 }
 
@@ -233,6 +281,12 @@ impl<'a> Iterator for CStrArrayIter<'a> {
         if offset == 0 {
             return None;
         }
+        // If `argc_offset` is set, we skip the first entry which is the `argc`
+        let offset = if let Some(argc_offset) = self.argc_offset {
+            offset - argc_offset
+        } else {
+            offset
+        };
 
         let buffer_offset = self.buffer.as_ptr() as usize - self.base as usize;
 

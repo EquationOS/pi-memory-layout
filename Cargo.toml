@@ -1,0 +1,17 @@
+[package]
+name = "pi_memory_layout"
+version = "0.1.0"
+edition = "2024"
+description = """
+A parser and builder for the Linux process execution arguments and environment variables
+with position-independenable layout - use it to decode or construct argc, argv, envp.
+"""
+
+[features]
+default = ["alloc", "builder"]
+alloc = []
+builder = ["alloc", "dep:aligned-vec"]
+
+
+[dependencies]
+aligned-vec = { version = "0.6.4", default-features = false, optional = true }

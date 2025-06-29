@@ -1,6 +1,8 @@
 use core::ffi::CStr;
 use core::fmt::Debug;
 
+use linux_libc_auxv::{AuxVar, AuxVarRaw, AuxVarType};
+
 use crate::util::count_bytes_until_null;
 
 /// Wraps a slice of bytes representing a Execution args and envs layout allowing to
@@ -71,6 +73,19 @@ impl<'a> ArgsLayoutRef<'a> {
         &base_slice[start..]
     }
 
+    /// Returns a view into the underlying buffer where the Auxiliary Vector
+    /// (`auxv`) begins. The slice ends at the end of the structure.
+    ///
+    /// This enables parsing the data until the end of that area is found.
+    fn get_slice_auxv(&self) -> &'a [u8] {
+        // auxv starts after envv
+        let base_slice = self.get_slice_envv();
+
+        // We skip the terminating null ptr after the envv
+        let start = self.envc() * size_of::<usize>() + size_of::<usize>() /* NUL */;
+        &base_slice[start..]
+    }
+
     // ========== END buffer get functions ==========
 
     /// Returns the number of arguments.
@@ -91,6 +106,12 @@ impl<'a> ArgsLayoutRef<'a> {
     #[must_use]
     pub fn envc(&self) -> usize {
         self.envv_raw_iter().count()
+    }
+
+    /// Returns the number of auxiliary vector entries.
+    #[must_use]
+    pub fn auxvc(&self) -> usize {
+        self.auxv_raw_iter().count()
     }
 
     /// Returns an iterator over the raw argument vector's (`argv`)
@@ -127,6 +148,17 @@ impl<'a> ArgsLayoutRef<'a> {
                 buffer,
             )
         }
+    }
+
+    /// Returns an iterator over the auxiliary variables vector's (`auxv`)
+    /// [`AuxVarRaw`] elements.
+    ///
+    /// # Safety
+    /// Any pointers must point to valid memory. If dereferenced, the memory
+    /// **must** be in the address space of the application. Otherwise,
+    /// segmentation faults or UB will occur.
+    pub fn auxv_raw_iter(&self) -> impl Iterator<Item = AuxVarRaw> {
+        AuxVarRawIter::new(self.get_slice_auxv())
     }
 
     /// Unsafe version of [`Self::argv_raw_iter`] that only works if all pointers
@@ -168,6 +200,20 @@ impl<'a> ArgsLayoutRef<'a> {
                 buffer,
             )
         }
+    }
+
+    /// Unsafe version of [`Self::argv_raw_iter`] that only works if all pointers
+    /// are valid. It emits high-level items of type [`AuxVar`].
+    ///
+    /// This is typically safe if you parse the stack layout you've got from
+    /// Linux but not if you parse some other's stack layout.
+    ///
+    /// # Safety
+    /// Any pointers must point to valid memory. If dereferenced, the memory
+    /// **must** be in the address space of the application. Otherwise,
+    /// segmentation faults or UB will occur.
+    pub unsafe fn auxv_iter(&self) -> impl Iterator<Item = AuxVar<'a>> {
+        unsafe { AuxVarIter::new(self.get_slice_auxv()) }
     }
 }
 
@@ -293,7 +339,7 @@ impl<'a> Iterator for CStrArrayIter<'a> {
         // Assert in range
         {
             let end = self.buffer.len() + buffer_offset;
-            assert!(offset > 0);
+            assert!(offset - buffer_offset > 0);
             assert!(offset <= end);
         }
 
@@ -306,6 +352,78 @@ impl<'a> Iterator for CStrArrayIter<'a> {
 
         self.i += 1;
         Some(cstr)
+    }
+}
+
+/// Iterates over the `auxv` array with dynamic size until the end key is found.
+///
+/// Emits elements of type [`AuxVarRaw`].
+#[derive(Debug)]
+pub struct AuxVarRawIter<'a> {
+    // Buffer holds more bytes than necessary because the size of the auxv
+    // array is not known at compile time.
+    auxv: &'a [u8],
+    i: usize,
+}
+
+impl<'a> AuxVarRawIter<'a> {
+    const fn new(auxv: &'a [u8]) -> Self {
+        Self { auxv, i: 0 }
+    }
+}
+
+impl<'a> Iterator for AuxVarRawIter<'a> {
+    type Item = AuxVarRaw;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = unsafe {
+            let entry_ptr = self.auxv.as_ptr().cast::<AuxVarRaw>().add(self.i);
+            entry_ptr.as_ref().unwrap()
+        };
+
+        if let Ok(key) = entry.key() {
+            if key == AuxVarType::Null {
+                None
+            } else {
+                self.i += 1;
+                Some(*entry)
+            }
+        } else {
+            // log error?
+            // invalid data, stop
+            None
+        }
+    }
+}
+
+/// Iterates the [`AuxVar`]s of the stack layout.
+#[derive(Debug)]
+pub struct AuxVarIter<'a> {
+    // Buffer holds more bytes than necessary because the size of the auxv
+    // array is not known at compile time.
+    auxv: &'a [u8],
+    serialized_iter: AuxVarRawIter<'a>,
+}
+
+impl<'a> AuxVarIter<'a> {
+    // SAFETY: If the pointers point to invalid memory, UB will occur.
+    const unsafe fn new(auxv: &'a [u8]) -> Self {
+        Self {
+            serialized_iter: AuxVarRawIter::new(auxv),
+            auxv,
+        }
+    }
+}
+
+impl<'a> Iterator for AuxVarIter<'a> {
+    type Item = AuxVar<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            self.serialized_iter
+                .next()
+                .map(|ref x| AuxVar::from_raw(x, self.auxv))
+        }
     }
 }
 

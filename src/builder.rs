@@ -3,24 +3,27 @@ use alloc::vec::Vec;
 use core::ffi::CStr;
 
 use aligned_vec::{ABox, AVec};
+use linux_libc_auxv::{AuxVar, AuxVarRaw, AuxVarType};
 
 /// Builder to create a position-independent arguments memory layout,
 /// as described by the [`ArgsLayoutRef`] type.
 ///
 /// [`ArgsLayoutRef`]: crate::ArgsLayoutRef
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ArgsLayoutBuilder {
+pub struct ArgsLayoutBuilder<'a> {
     argv: Vec<String>,
     envv: Vec<String>,
+    auxv: Vec<AuxVar<'a>>,
 }
 
-impl ArgsLayoutBuilder {
+impl<'a> ArgsLayoutBuilder<'a> {
     /// Creates a mew bioöder-
     #[must_use]
     pub const fn new() -> Self {
         Self {
             argv: vec![],
             envv: vec![],
+            auxv: vec![],
         }
     }
 
@@ -77,6 +80,14 @@ impl ArgsLayoutBuilder {
         self.envv.push(env);
     }
 
+    /// Adds an [`AuxVar`] to the builder.
+    pub fn add_auxv(&mut self, aux: AuxVar<'a>) {
+        // Ignore, we do this automatically in the end.
+        if aux != AuxVar::Null {
+            self.auxv.push(aux);
+        }
+    }
+
     /// Returns the size in bytes needed for the `argv` entries.
     ///
     /// This includes the terminating null entry.
@@ -89,6 +100,13 @@ impl ArgsLayoutBuilder {
     /// This includes the terminating null entry.
     fn calc_len_envv_entries(&self) -> usize {
         (self.envv.len() + 1/* null */) * size_of::<usize>()
+    }
+
+    /// Returns the size in bytes needed for the `auxv` entries.
+    ///
+    /// This includes the terminating null entry.
+    fn calc_len_auxv_entries(&self) -> usize {
+        (self.auxv.len() + 1/* NULL entry */) * size_of::<AuxVarRaw>()
     }
 
     fn _calc_len_data_cstr(strs: &[String]) -> usize {
@@ -113,6 +131,33 @@ impl ArgsLayoutBuilder {
         Self::_calc_len_data_cstr(&self.envv)
     }
 
+    /// Returns the size in bytes needed for the `auxv` data area.
+    ///
+    /// This includes any terminating null entries or padding.
+    fn calc_len_auxv_data(&self) -> usize {
+        self.auxv
+            .iter()
+            .map(|aux| {
+                match aux {
+                    AuxVar::Platform(v) => {
+                        v.count_bytes() + 1 /* NUL */
+                    }
+                    AuxVar::BasePlatform(v) => {
+                        v.count_bytes() + 1 /* NUL */
+                    }
+                    AuxVar::Random(v) => {
+                        assert_eq!(v.len(), 16);
+                        16 /* fixed size */
+                    }
+                    AuxVar::ExecFn(v) => {
+                        v.count_bytes() + 1 /* NUL */
+                    }
+                    _ => 0,
+                }
+            })
+            .sum::<usize>()
+    }
+
     /// Returns the total size in bytes needed for the structure.
     ///
     /// This includes any null entries or padding.
@@ -120,8 +165,10 @@ impl ArgsLayoutBuilder {
         size_of::<usize>() /* argc */ +
             self.calc_len_argv_entries()
             + self.calc_len_envv_entries()
+            + self.calc_len_auxv_entries()
             + self.calc_len_argv_data()
             + self.calc_len_envv_data()
+            + self.calc_len_auxv_data()
     }
 
     /// Builds the layout with heap-allocated memory.
@@ -142,8 +189,10 @@ impl ArgsLayoutBuilder {
             &mut buffer,
             self.calc_len_argv_entries(),
             self.calc_len_envv_entries(),
+            self.calc_len_auxv_entries(),
             self.calc_len_argv_data(),
             self.calc_len_envv_data(),
+            self.calc_len_auxv_data(),
         );
 
         serializer.write_argc(self.argv.len());
@@ -159,6 +208,10 @@ impl ArgsLayoutBuilder {
             serializer.write_env(c_str);
         }
         // Writing NULL entry not necessary, the buffer is already zeroed
+
+        for var in self.auxv {
+            serializer.write_aux(&var);
+        }
 
         buffer
     }
@@ -192,8 +245,10 @@ impl ArgsLayoutBuilder {
             &mut buffer,
             self.calc_len_argv_entries(),
             self.calc_len_envv_entries(),
+            self.calc_len_auxv_entries(),
             self.calc_len_argv_data(),
             self.calc_len_envv_data(),
+            self.calc_len_auxv_data(),
         );
 
         serializer.write_argc(self.argv.len());
@@ -209,6 +264,10 @@ impl ArgsLayoutBuilder {
             serializer.write_env(c_str);
         }
         // Writing NULL entry not necessary, the buffer is already zeroed
+
+        for var in self.auxv {
+            serializer.write_aux(&var);
+        }
 
         (stack_base, len)
     }
@@ -228,9 +287,14 @@ struct StackLayoutSerializer<'a> {
     // Offset in bytes for writes
     offset_envv: usize,
     // Offset in bytes for writes
+    offset_auxv: usize,
+    // Offset in bytes for writes
     offset_argv_data: usize,
     // Offset in bytes for writes
     offset_envv_data: usize,
+    // Offset in bytes for writes
+    #[allow(unused)]
+    offset_auxv_data: usize,
 }
 
 impl<'a> StackLayoutSerializer<'a> {
@@ -246,27 +310,34 @@ impl<'a> StackLayoutSerializer<'a> {
         buffer: &'a mut [u8],
         len_argv_entries: usize,
         len_envv_entries: usize,
+        len_auxv_entries: usize,
         len_argv_data: usize,
         len_envv_data: usize,
+        len_auxv_data: usize,
     ) -> Self {
         assert_eq!(buffer.as_ptr().align_offset(align_of::<usize>()), 0);
 
-        let total_size = size_of::<usize>() /* initial argc */ + len_argv_entries + len_envv_entries
-            + len_argv_data + len_envv_data;
+        let total_size = size_of::<usize>() /* initial argc */ + len_argv_entries + len_envv_entries + len_auxv_entries
+            + len_argv_data + len_envv_data + len_auxv_data;
         assert!(buffer.len() >= total_size);
 
         // These offsets include any necessary NULL entries and NUL bytes.
         let offset_argv = size_of::<usize>() /* initial argc */;
         let offset_envv = offset_argv + len_argv_entries;
-        let offset_argv_data = offset_envv + len_envv_entries;
+        let offset_auxv = offset_envv + len_envv_entries;
+        // auxv data area comes first, then argv, then envv
+        let offset_auxv_data = offset_auxv + len_auxv_entries;
+        let offset_argv_data = offset_auxv_data + len_auxv_data;
         let offset_envv_data = offset_argv_data + len_argv_data;
 
         Self {
             buffer,
             offset_argv: size_of::<usize>(), /* argc */
             offset_envv,
+            offset_auxv,
             offset_argv_data,
             offset_envv_data,
+            offset_auxv_data,
         }
     }
 
@@ -338,6 +409,54 @@ impl<'a> StackLayoutSerializer<'a> {
             &mut self.offset_envv,
             &mut self.offset_envv_data,
         );
+
+        self.sanity_checks();
+    }
+
+    /// Writes an auxiliary variable into the auxiliary vector.
+    fn write_aux_immediate(&mut self, key: AuxVarType, val: usize) {
+        let ptr = self.buffer.as_mut_ptr().cast::<u8>();
+        let ptr = unsafe { ptr.add(self.offset_auxv) };
+        let value = AuxVarRaw::new(key, val);
+        unsafe { core::ptr::write(ptr.cast::<AuxVarRaw>(), value) }
+        self.offset_auxv += size_of::<AuxVarRaw>();
+    }
+
+    /// Writes the referenced data of an auxiliary vector into the
+    /// _auxv data area_.
+    ///
+    /// Unimplemented for some keys:
+    /// - [`AuxVarType::Platform`]
+    /// - [`AuxVarType::BasePlatform`]
+    /// - [`AuxVarType::Random`]
+    /// - [`AuxVarType::ExecFn`]
+    ///
+    /// If we want to implement these keys, we need a customized type of [`AuxVar`],
+    /// with a `_from_raw_to_cstr` method that can handle the conversion
+    /// from the raw data to a CStr according to the relative offset
+    /// in the buffer.
+    fn write_aux_refdata(&mut self, key: AuxVarType, _data: &[u8], _add_nul_byte: bool) {
+        unimplemented!(
+            "AuxVar::write_aux_refdata() not implemented for key: {:?}",
+            key
+        );
+    }
+
+    /// Deconstructs a [`AuxVar`] and writes the corresponding [`AuxVarRaw`]
+    /// into the structure.
+    /// Unimplemented for some keys:
+    /// - [`AuxVarType::Platform`]
+    /// - [`AuxVarType::BasePlatform`]
+    /// - [`AuxVarType::Random`]
+    /// - [`AuxVarType::ExecFn`]
+    fn write_aux(&mut self, aux: &AuxVar<'a>) {
+        match aux {
+            AuxVar::Platform(v) => self.write_aux_refdata(aux.key(), v.as_bytes(), true),
+            AuxVar::BasePlatform(v) => self.write_aux_refdata(aux.key(), v.as_bytes(), true),
+            AuxVar::Random(v) => self.write_aux_refdata(aux.key(), v, false),
+            AuxVar::ExecFn(v) => self.write_aux_refdata(aux.key(), v.as_bytes(), true),
+            _ => self.write_aux_immediate(aux.key(), aux.value_raw()),
+        }
 
         self.sanity_checks();
     }

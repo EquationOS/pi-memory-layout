@@ -15,3 +15,7 @@ builder = ["alloc", "dep:aligned-vec"]
 
 [dependencies]
 aligned-vec = { version = "0.6.4", default-features = false, optional = true }
+linux-libc-auxv = { git = "https://github.com/EquationOS/linux-libc-auxv.git", default-features = false }
+
+[patch."https://github.com/EquationOS/linux-libc-auxv.git"]
+linux-libc-auxv = { path = "../linux-libc-auxv" }
